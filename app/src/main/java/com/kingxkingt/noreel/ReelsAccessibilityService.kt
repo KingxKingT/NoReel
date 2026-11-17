@@ -305,6 +305,27 @@ class ReelsAccessibilityService : AccessibilityService() {
         return false
     }
 
+    private fun hasReelsLabelInSubtree(
+        node: AccessibilityNodeInfo,
+        depth: Int,
+        visited: IntArray
+    ): Boolean {
+        if (depth > 4 || visited[0] >= 80 || !node.isVisibleToUser) return false
+        visited[0]++
+        if (hasReelsLabel(node)) return true
+
+        for (index in 0 until node.childCount) {
+            val child = node.getChild(index) ?: continue
+            val found = try {
+                hasReelsLabelInSubtree(child, depth + 1, visited)
+            } finally {
+                child.recycle()
+            }
+            if (found) return true
+        }
+        return false
+    }
+
     private fun findReelsTab(
         node: AccessibilityNodeInfo,
         depth: Int,
@@ -320,7 +341,10 @@ class ReelsAccessibilityService : AccessibilityService() {
         // clips_tab is a specific Instagram navigation ID. Do not require a guessed
         // bottom-screen percentage for this exact marker; that was too restrictive.
         val exactId = id in REELS_TAB_IDS
-        val labelFallback = isBottomNavigation(bounds) && hasReelsLabel(node)
+        // Some Instagram versions expose the tab label on a child node while
+        // the clickable navigation cell is its parent. Search the small subtree
+        // so we can still identify that cell when the icon itself has no label.
+        val labelFallback = hasReelsLabelInSubtree(node, 0, intArrayOf(0))
 
         if (exactId || labelFallback) {
             val target = bestTabBounds(node, bounds)
@@ -712,8 +736,26 @@ class ReelsAccessibilityService : AccessibilityService() {
         }.apply {
             isClickable = true
             isFocusable = false
-            contentDescription = "Reels blocked by NoReel"
+            contentDescription = "Reels blocked by NoReel. Tap to return to your inbox."
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+            // The overlay replaces the native Reels tab, so it must provide a useful
+            // action itself. Without this listener it swallowed taps but did nothing.
+            setOnClickListener {
+                val activeRoot = rootInActiveWindow
+                if (activeRoot != null) {
+                    try {
+                        if (activeRoot.packageName?.toString() == INSTAGRAM) {
+                            leaveReelsTab(activeRoot)
+                        } else {
+                            performGlobalAction(GLOBAL_ACTION_BACK)
+                        }
+                    } finally {
+                        activeRoot.recycle()
+                    }
+                } else {
+                    performGlobalAction(GLOBAL_ACTION_BACK)
+                }
+            }
         }
 
         val layout = WindowManager.LayoutParams(
