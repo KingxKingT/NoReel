@@ -193,11 +193,21 @@ class ReelsAccessibilityService : AccessibilityService() {
         }
     }
 
+    private var scanPending = false
+
+    private val scanRunnable = Runnable {
+        scanPending = false
+        lastScanAt = System.currentTimeMillis()
+        scanInstagramWindow()
+    }
+
     private fun scanSoon() {
-        val now = System.currentTimeMillis()
-        if (now - lastScanAt < SCAN_INTERVAL_MS) return
-        lastScanAt = now
-        handler.post { scanInstagramWindow() }
+        // Trailing throttle: never drop the last event, otherwise a Reels screen that
+        // appears right after another event could go unnoticed.
+        if (scanPending) return
+        scanPending = true
+        val wait = (SCAN_INTERVAL_MS - (System.currentTimeMillis() - lastScanAt)).coerceAtLeast(0L)
+        handler.postDelayed(scanRunnable, wait)
     }
 
     private fun scanInstagramWindow() {
@@ -838,6 +848,7 @@ class ReelsAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         handler.removeCallbacks(verifyViewer)
         handler.removeCallbacks(verifyTabExit)
+        handler.removeCallbacks(scanRunnable)
         removeTabCover()
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putBoolean("service_connected", false)
