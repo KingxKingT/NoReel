@@ -3,7 +3,9 @@ package com.kingxkingt.noreel
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Intent
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.PixelFormat
 import android.net.Uri
@@ -30,6 +32,7 @@ class ReelsAccessibilityService : AccessibilityService() {
         private const val PREFS = "noreel"
         private const val SCAN_INTERVAL_MS = 180L
         private const val VERIFY_DELAY_MS = 450L
+        private const val TAB_MISSING_GRACE_MS = 700L
         private const val MAX_BACK_ATTEMPTS = 3
         private const val MAX_DEPTH = 35
         private const val MAX_NODES = 1800
@@ -61,6 +64,7 @@ class ReelsAccessibilityService : AccessibilityService() {
     private var windowManager: WindowManager? = null
     private var tabCover: View? = null
     private var tabCoverBounds: Rect? = null
+    private var lastTabSeenAt = 0L
     private var tabExitAt = 0L
 
     private val verifyViewer = Runnable {
@@ -185,21 +189,31 @@ class ReelsAccessibilityService : AccessibilityService() {
 
             val tab = findReelsTab(root, 0, intArrayOf(0))
             if (tab == null) {
-                removeTabCover()
+                // Instagram occasionally publishes a partial accessibility tree while
+                // rebuilding its bottom bar. Keep the replacement icon briefly so the
+                // original Reels glyph does not flash back during that gap.
+                val keepExistingCover = tabCover != null &&
+                    System.currentTimeMillis() - lastTabSeenAt <= TAB_MISSING_GRACE_MS
+                if (!keepExistingCover) {
+                    removeTabCover()
+                } else {
+                    handler.postDelayed({ scanInstagramWindow() }, 200L)
+                }
                 recordNoMatchSparingly()
                 return
             }
 
+            lastTabSeenAt = System.currentTimeMillis()
             if (tab.selected) {
                 removeTabCover()
                 leaveReelsTab(root)
                 return
             }
 
-            if (tabCoverBounds != tab.bounds) {
+            if (tabCover == null || tabCoverBounds != tab.bounds) {
                 showTabCover(tab.bounds)
             }
-            recordStatus("Reels navigation tab found")
+            recordStatus("Reels navigation tab replaced with NoReel stop icon")
         } finally {
             root.recycle()
         }
@@ -219,11 +233,12 @@ class ReelsAccessibilityService : AccessibilityService() {
         labels(node).any { it in REELS_LABELS }
 
     private fun isBottomNavigation(bounds: Rect): Boolean {
-        val screenHeight = resources.displayMetrics.heightPixels
-        return bounds.width() > 0 &&
-            bounds.height() > 0 &&
-            bounds.top >= screenHeight * 0.66f &&
-            bounds.bottom <= screenHeight + dp(48)
+        val metrics = resources.displayMetrics
+        val maxCellWidth = (metrics.widthPixels * 0.38f).toInt()
+        return bounds.width() in 1..maxCellWidth &&
+            bounds.height() in 1..dp(120) &&
+            bounds.top >= metrics.heightPixels * 0.78f &&
+            bounds.bottom <= metrics.heightPixels + dp(48)
     }
 
     private fun isReelsTabOrChild(node: AccessibilityNodeInfo): Boolean {
@@ -270,7 +285,10 @@ class ReelsAccessibilityService : AccessibilityService() {
 
         if (exactId || labelFallback) {
             val target = bestTabBounds(node, bounds)
-            if (target != null) {
+            // Exact IDs are useful, but Instagram has exposed stale/incorrect bounds
+            // for this node on some layouts. Never place an overlay outside the real
+            // bottom-navigation strip (for example, over Stories or the feed).
+            if (target != null && isBottomNavigation(target)) {
                 val selected = node.isSelected || hasSelectedDescendant(node, 0, intArrayOf(0))
                 return TabMatch(target, selected)
             }
@@ -454,20 +472,49 @@ class ReelsAccessibilityService : AccessibilityService() {
     private fun showTabCover(bounds: Rect) {
         removeTabCover()
 
-        val padding = dp(4)
         val metrics = resources.displayMetrics
-        val left = (bounds.left - padding).coerceAtLeast(0)
-        val top = (bounds.top - padding).coerceAtLeast(0)
-        val right = (bounds.right + padding).coerceAtMost(metrics.widthPixels)
-        val bottom = (bounds.bottom + padding).coerceAtMost(metrics.heightPixels)
+        val left = bounds.left.coerceAtLeast(0)
+        val top = bounds.top.coerceAtLeast(0)
+        val right = bounds.right.coerceAtMost(metrics.widthPixels)
+        val bottom = bounds.bottom.coerceAtMost(metrics.heightPixels)
         if (right <= left || bottom <= top) return
 
         val darkMode = (resources.configuration.uiMode and 0x30) == 0x20
-        val overlay = View(this).apply {
-            setBackgroundColor(if (darkMode) Color.BLACK else Color.WHITE)
+        val overlay = object : View(this) {
+            private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.FILL
+                color = if (darkMode) Color.BLACK else Color.WHITE
+            }
+            private val outline = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE
+                strokeWidth = dp(2).toFloat()
+                strokeCap = Paint.Cap.ROUND
+                color = if (darkMode) Color.WHITE else Color.rgb(38, 38, 38)
+            }
+
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                // Draw only a compact circle-slash glyph. The rest of the tab cell
+                // stays transparent, so the Instagram bar keeps its native spacing.
+                val radius = minOf(dp(14).toFloat(), minOf(width, height) * 0.47f)
+                if (radius < dp(6)) return
+                val cx = width / 2f
+                val cy = height / 2f
+                canvas.drawCircle(cx, cy, radius + dp(1).toFloat(), fill)
+                canvas.drawCircle(cx, cy, radius - dp(1).toFloat(), outline)
+                canvas.drawLine(
+                    cx - radius * 0.56f,
+                    cy + radius * 0.56f,
+                    cx + radius * 0.56f,
+                    cy - radius * 0.56f,
+                    outline
+                )
+            }
+        }.apply {
             isClickable = true
             isFocusable = false
-            contentDescription = "Reels tab blocked by NoReel"
+            contentDescription = "Reels blocked by NoReel"
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
         }
 
         val layout = WindowManager.LayoutParams(
@@ -476,7 +523,7 @@ class ReelsAccessibilityService : AccessibilityService() {
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.OPAQUE
+            PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = left
@@ -487,19 +534,22 @@ class ReelsAccessibilityService : AccessibilityService() {
             windowManager?.addView(overlay, layout)
             tabCover = overlay
             tabCoverBounds = Rect(bounds)
-            recordBlock("Reels navigation tab hidden")
-            Log.i(TAG, "Reels navigation tab covered at " + bounds.toShortString())
+            recordBlock("Reels navigation tab replaced with NoReel stop icon")
+            Log.i(TAG, "Reels navigation stop icon placed at " + bounds.toShortString())
         } catch (error: Exception) {
-            Log.w(TAG, "Could not cover Reels tab", error)
-            recordStatus("Reels tab found, but the screen overlay could not be placed")
+            Log.w(TAG, "Could not replace Reels tab icon", error)
+            recordStatus("Reels tab found, but the stop icon could not be placed")
         }
     }
 
     private fun removeTabCover() {
-        val overlay = tabCover ?: return
-        runCatching { windowManager?.removeView(overlay) }
+        val overlay = tabCover
+        if (overlay != null) {
+            runCatching { windowManager?.removeView(overlay) }
+        }
         tabCover = null
         tabCoverBounds = null
+        lastTabSeenAt = 0L
     }
 
     private fun recordBlock(description: String) {
