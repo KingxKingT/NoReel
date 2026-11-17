@@ -23,6 +23,11 @@ object ProtectionPolicy {
         }
     }
 
+    fun isAdminActive(context: Context): Boolean {
+        val dpm = context.getSystemService(DevicePolicyManager::class.java) ?: return false
+        return dpm.isAdminActive(ComponentName(context, NoReelAdminReceiver::class.java))
+    }
+
     fun isDeviceOwner(context: Context): Boolean =
         context.getSystemService(DevicePolicyManager::class.java)?.isDeviceOwnerApp(context.packageName) == true
 
