@@ -23,8 +23,30 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Build debug APK
-        run: gradle assembleDebug --stacktrace
+      - name: Prepare persistent signing key
+        env:
+          NOREEL_KEYSTORE_BASE64: ${{ secrets.NOREEL_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NOREEL_KEYSTORE_BASE64:-}" ]; then
+            echo "::error::Missing repository secret NOREEL_KEYSTORE_BASE64. See docs/ANDROID_SIGNING.md."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/noreel-signing"
+          printf '%s' "$NOREEL_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/noreel-signing/upload-key.p12"
+          test -s "$RUNNER_TEMP/noreel-signing/upload-key.p12"
+      - name: Build signed debug APK
+        env:
+          NOREEL_KEYSTORE_PATH: ${{ runner.temp }}/noreel-signing/upload-key.p12
+          NOREEL_KEYSTORE_PASSWORD: ${{ secrets.NOREEL_KEYSTORE_PASSWORD }}
+          NOREEL_KEY_ALIAS: ${{ secrets.NOREEL_KEY_ALIAS }}
+          NOREEL_KEY_PASSWORD: ${{ secrets.NOREEL_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$NOREEL_KEYSTORE_PASSWORD"
+          test -n "$NOREEL_KEY_ALIAS"
+          test -n "$NOREEL_KEY_PASSWORD"
+          gradle assembleDebug --stacktrace
       - name: Verify APK
         run: test -s app/build/outputs/apk/debug/app-debug.apk
       - name: Upload APK
