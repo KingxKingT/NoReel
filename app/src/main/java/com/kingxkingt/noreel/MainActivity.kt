@@ -219,8 +219,8 @@ class MainActivity : Activity() {
         body.addView(text("One-time setup", 18f, ink, true))
         addSpace(body, 11)
         val admin = setupStep(
-            "Uninstall guard",
-            "Adds an extra confirmation step before NoReel can be removed."
+            "Uninstall guard (optional)",
+            "Extra protection against removal. Not required for Reels blocking."
         ) { requestDeviceAdmin() }
         adminStatus = admin.second
         body.addView(admin.first)
@@ -316,11 +316,6 @@ class MainActivity : Activity() {
             return
         }
 
-        if (!ProtectionPolicy.isAdminActive(this)) {
-            Toast.makeText(this, "Enable the uninstall guard first.", Toast.LENGTH_LONG).show()
-            requestDeviceAdmin()
-            return
-        }
         if (!enabled()) {
             Toast.makeText(this, "Enable NoReel in Accessibility settings first.", Toast.LENGTH_LONG).show()
             openAccessibilitySettings()
@@ -328,7 +323,9 @@ class MainActivity : Activity() {
         }
 
         val until = CommitmentTimer.start(this, (dayCount * 24L + hourCount) * 3600000L)
-        val hardened = runCatching { ProtectionPolicy.apply(this) }.getOrDefault(false)
+        val hardened = if (ProtectionPolicy.isAdminActive(this)) {
+            runCatching { ProtectionPolicy.apply(this) }.getOrDefault(false)
+        } else false
         Toast.makeText(
             this,
             if (hardened) "Commitment started. Extra device restrictions are active."
@@ -346,6 +343,7 @@ class MainActivity : Activity() {
         val owner = ProtectionPolicy.isDeviceOwner(this)
         val diagnosticPrefs = getSharedPreferences("noreel", MODE_PRIVATE)
         val blockCount = diagnosticPrefs.getInt("block_count", 0)
+        val serviceConnected = diagnosticPrefs.getBoolean("service_connected", false)
         val lastDetection = diagnosticPrefs.getString("last_detection", "No Reels screen detected yet")
             ?: "No Reels screen detected yet"
         val detectionAt = diagnosticPrefs.getLong("last_detection_at", 0L)
@@ -356,7 +354,8 @@ class MainActivity : Activity() {
             "Not yet"
         }
         diagnostics.text =
-            "Accessibility: " + if (accessibility) "ON" else "OFF" +
+            "Accessibility enabled: " + if (accessibility) "YES" else "NO" +
+            "\\nService connected: " + if (serviceConnected) "YES" else "NO" +
             "\\nBlocks detected: " + blockCount +
             "\\nLast check: " + lastDetection +
             "\\nTime: " + detectionTime
@@ -373,9 +372,9 @@ class MainActivity : Activity() {
         )
 
         statusBadge.text = when {
-            active && accessibility -> "ACTIVE"
+            active && accessibility && serviceConnected -> "ACTIVE"
             active -> "CHECK SETUP"
-            admin && accessibility -> "READY"
+            accessibility -> "READY"
             else -> "NOT ACTIVE"
         }
         statusBadge.setTextColor(if (active && accessibility) accent else muted)
@@ -398,11 +397,11 @@ class MainActivity : Activity() {
             }
             commitmentCard.visibility = View.GONE
         } else {
-            statusTitle.text = if (admin && accessibility) "You're ready to focus" else "Protection is not active"
-            statusDescription.text = if (admin && accessibility) {
-                "Both setup steps are complete. Choose a commitment below to start blocking Reels."
+            statusTitle.text = if (accessibility) "You're ready to focus" else "Protection is not active"
+            statusDescription.text = if (accessibility) {
+                "Accessibility is enabled. The uninstall guard is optional. Choose a commitment to start."
             } else {
-                "Finish the two setup steps, then choose how long you want to stay Reels-free."
+                "Enable NoReel in Android Accessibility settings. The uninstall guard is optional."
             }
             commitmentCard.visibility = View.VISIBLE
         }
