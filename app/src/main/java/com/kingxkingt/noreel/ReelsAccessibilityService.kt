@@ -38,6 +38,7 @@ class ReelsAccessibilityService : AccessibilityService() {
             Log.d(TAG, "Reels viewer closed")
             viewerBeingClosed = false
             backAttempts = 0
+            lastBack = 0L
             return@Runnable
         }
         if (backAttempts >= MAX_BACK_ATTEMPTS) {
