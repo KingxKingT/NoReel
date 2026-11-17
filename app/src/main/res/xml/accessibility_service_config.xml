@@ -4,5 +4,4 @@
     android:notificationTimeout="60"
     android:canRetrieveWindowContent="true"
     android:description="@string/accessibility_description"
-    android:packageNames="com.instagram.android"
     android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews" />
