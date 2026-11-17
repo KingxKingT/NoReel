@@ -37,17 +37,26 @@ class ReelsAccessibilityService : AccessibilityService() {
         private const val MAX_DEPTH = 35
         private const val MAX_NODES = 1800
 
-        private val REELS_TAB_IDS = setOf("clips_tab")
+        private val REELS_TAB_IDS = setOf(
+            "clips_tab",
+            "reels_tab",
+            "tab_clips",
+            "reels_nav_item",
+            "clips_nav_item"
+        )
         private val REELS_VIEWER_IDS = setOf(
             "clips_viewer_view_pager",
-            "clips_viewer_fragment_container"
+            "clips_viewer_fragment_container",
+            "clips_viewer_container",
+            "clips_video_container",
+            "clips_recycler_view"
         )
         private val INBOX_TAB_IDS = setOf(
             "direct_tab",
             "inbox_tab",
             "action_bar_inbox_button"
         )
-        private val REELS_LABELS = setOf("reels", "reel", "reels tab", "watch reels")
+        private val REELS_LABELS = setOf("reels", "reel", "reels tab", "reel tab", "watch reels")
     }
 
     private data class TabMatch(
@@ -155,7 +164,15 @@ class ReelsAccessibilityService : AccessibilityService() {
 
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> scanSoon()
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> scanSoon()
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> scanSoon()
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+                val source = event.source
+                val scrollIsInsideViewer = if (source == null) false else try {
+                    isInsideReelsViewer(source)
+                } finally {
+                    source.recycle()
+                }
+                if (scrollIsInsideViewer) closeViewer() else scanSoon()
+            }
         }
     }
 
@@ -365,6 +382,44 @@ class ReelsAccessibilityService : AccessibilityService() {
         return result
     }
 
+    /**
+     * Instagram has used several dedicated "clips" containers for the full-screen
+     * Reels player. Require a large on-screen node so a small inline DM preview
+     * cannot be mistaken for the full-screen viewer.
+     */
+    private fun isReelsViewerMarker(node: AccessibilityNodeInfo): Boolean {
+        if (!node.isVisibleToUser || shortId(node) !in REELS_VIEWER_IDS) return false
+
+        val bounds = Rect()
+        node.getBoundsInScreen(bounds)
+        val metrics = resources.displayMetrics
+        val screenArea = metrics.widthPixels.toDouble() * metrics.heightPixels.toDouble()
+        if (screenArea <= 0.0) return false
+
+        val coverage = bounds.width().toDouble() * bounds.height().toDouble() / screenArea
+        return bounds.width() >= metrics.widthPixels * 0.55f &&
+            bounds.height() >= metrics.heightPixels * 0.45f &&
+            coverage >= 0.40
+    }
+
+    private fun isInsideReelsViewer(node: AccessibilityNodeInfo): Boolean {
+        var current: AccessibilityNodeInfo? = AccessibilityNodeInfo.obtain(node)
+        var depth = 0
+        try {
+            while (current != null && depth <= 8) {
+                if (isReelsViewerMarker(current)) return true
+
+                val parent = current.parent
+                current.recycle()
+                current = parent
+                depth++
+            }
+        } finally {
+            current?.recycle()
+        }
+        return false
+    }
+
     private fun containsReelsViewer(
         node: AccessibilityNodeInfo,
         depth: Int,
@@ -373,9 +428,8 @@ class ReelsAccessibilityService : AccessibilityService() {
         if (depth > MAX_DEPTH || visited[0] >= MAX_NODES || !node.isVisibleToUser) return false
         visited[0]++
 
-        // These IDs specifically identify the Clips/Reels viewer. Do not match reel_*:
-        // those IDs are also used by Instagram Stories and other non-Reels surfaces.
-        if (shortId(node) in REELS_VIEWER_IDS) return true
+        // Never match generic reel_* IDs: Instagram also uses those for Stories.
+        if (isReelsViewerMarker(node)) return true
 
         for (index in 0 until node.childCount) {
             val child = node.getChild(index) ?: continue
