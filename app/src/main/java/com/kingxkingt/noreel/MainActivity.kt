@@ -34,6 +34,7 @@ class MainActivity : Activity() {
     private lateinit var adminStatus: TextView
     private lateinit var accessibilityStatus: TextView
     private lateinit var commitmentCard: LinearLayout
+    private lateinit var diagnostics: TextView
     private lateinit var days: EditText
     private lateinit var hours: EditText
 
@@ -202,6 +203,18 @@ class MainActivity : Activity() {
         protectionCard.addView(statusDescription)
         body.addView(protectionCard)
 
+        addSpace(body, 12)
+        val diagnosticsCard = card()
+        diagnosticsCard.addView(text("BLOCKING CHECK", 10f, muted, true).apply {
+            letterSpacing = 0.10f
+        })
+        diagnostics = text("Waiting for Instagram activity", 12f, muted).apply {
+            setPadding(0, dp(8), 0, 0)
+            setLineSpacing(dp(3).toFloat(), 1f)
+        }
+        diagnosticsCard.addView(diagnostics)
+        body.addView(diagnosticsCard)
+
         addSpace(body, 26)
         body.addView(text("One-time setup", 18f, ink, true))
         addSpace(body, 11)
@@ -331,6 +344,22 @@ class MainActivity : Activity() {
         val admin = ProtectionPolicy.isAdminActive(this)
         val accessibility = enabled()
         val owner = ProtectionPolicy.isDeviceOwner(this)
+        val diagnosticPrefs = getSharedPreferences("noreel", MODE_PRIVATE)
+        val blockCount = diagnosticPrefs.getInt("block_count", 0)
+        val lastDetection = diagnosticPrefs.getString("last_detection", "No Reels screen detected yet")
+            ?: "No Reels screen detected yet"
+        val detectionAt = diagnosticPrefs.getLong("last_detection_at", 0L)
+        val detectionTime = if (detectionAt > 0L) {
+            java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT)
+                .format(java.util.Date(detectionAt))
+        } else {
+            "Not yet"
+        }
+        diagnostics.text =
+            "Accessibility: " + if (accessibility) "ON" else "OFF" +
+            "\\nBlocks detected: " + blockCount +
+            "\\nLast check: " + lastDetection +
+            "\\nTime: " + detectionTime
 
         adminStatus.text = if (admin) "READY" else "ENABLE"
         adminStatus.setTextColor(if (admin) accent else muted)

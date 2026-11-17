@@ -1,40 +1,33 @@
 # NoReel
 
-NoReel is an Android app designed to keep Instagram messages, profiles, and regular posts available while blocking the Reels tab and full-screen Reels player.
+NoReel is an Android app that keeps Instagram messages, profiles, and regular posts available while blocking the dedicated Reels tab and full-screen Reels viewer.
 
-## What it does
+## Blocking approach
 
 - Uses an Android AccessibilityService scoped to Instagram.
-- Covers the Reels bottom-navigation item while a commitment is active.
-- Detects the full-screen Reels player through multiple Instagram accessibility resource-ID patterns, with a screen-size check to avoid confusing small thumbnails or Stories with the viewer.
-- Uses the same full-screen-player detection for Reels opened from the Reels tab, feed, profiles, and DMs. When detected, it presses Back to return to the previous Instagram screen.
-- Includes a commitment timer in days and hours.
-- Restores the timer after reboot and expires it automatically.
-- Includes an optional Device Owner hardening mode for supported devices.
+- Covers the Reels bottom-navigation item when the exact `clips_tab` marker or a matching bottom-navigation description is exposed.
+- Detects the dedicated full-screen viewer using Instagram's `clips_viewer_view_pager` and `clips_viewer_fragment_container` markers. A Reel opened from a DM is closed with Back, returning to the previous chat when Instagram preserves that navigation stack.
+- Does not match generic `reel_*` IDs because those can belong to Stories.
+- Displays a local block counter and the last detected surface in NoReel to help diagnose Instagram UI changes.
+- Includes a commitment timer and optional Device Owner hardening.
 
 ## Important limitations
 
-- Instagram does not publish stable accessibility IDs. An Instagram update can change its view hierarchy and require new detection hints.
-- Reels opened in the full-screen player are the target. Inline autoplay previews inside the feed or a DM may still be visible before the full-screen player opens.
-- The app has not been verified on every Instagram version or phone. A successful APK build does not prove that detection works on a particular device.
-- The ordinary Device Admin step adds friction but is not equivalent to Device Owner mode. Device Owner provisioning is optional and requires a fresh/unprovisioned device and ADB.
-- Device Owner restrictions are stronger but not impossible to bypass; factory reset, recovery, privileged ADB, manufacturer behavior, and bootloader-level actions may still defeat them.
-- The debug APK is for direct testing, not a Play Store release.
-
-## Build
-
-GitHub Actions builds app-debug.apk after pushes to main. Open the Actions tab, select the latest successful Build Android APK run, and download the NoReel-debug-apk artifact.
+- Instagram's internal view IDs are undocumented and can change. The new detector uses specific known markers, but it still needs testing against the exact Instagram build and device.
+- Inline autoplay previews embedded inside a DM conversation are not the same as the full-screen Reels viewer and may remain visible.
+- If Instagram stops exposing the known viewer marker, the app may not detect that version. The in-app Blocking Check shows the last detection result.
+- The app has not been verified on every phone. A successful APK build does not prove that Reels detection works on a particular device.
+- Device Admin is only a small uninstall barrier. Stronger restrictions require optional Device Owner provisioning on a fresh/unprovisioned device and ADB.
 
 ## Install and setup
 
-1. Download and install the debug APK.
-2. Open NoReel and enable the uninstall guard when prompted.
-3. Tap Accessibility access and enable NoReel.
-4. Return to NoReel and set a commitment in days and hours.
-5. Start the commitment.
+1. Install the APK.
+2. Enable the uninstall guard when prompted.
+3. Enable NoReel in Android Accessibility settings.
+4. Return to NoReel and start a commitment.
+5. Confirm the Blocking Check says Accessibility is ON.
+6. Open Instagram and test the Reels tab and a Reel opened from a DM.
 
-For stronger protection, read docs/DEVICE_OWNER.md before provisioning. It requires a fresh/unprovisioned device and ADB. Back up your phone first.
+## Build
 
-## Status
-
-The Android project and automated APK build are in development. The APK must build successfully and then pass real-device testing before it should be treated as dependable.
+GitHub Actions builds `app-debug.apk` on pushes to `main`. Open the Actions tab, select the latest successful **Build Android APK** run, and download the `NoReel-debug-apk` artifact.

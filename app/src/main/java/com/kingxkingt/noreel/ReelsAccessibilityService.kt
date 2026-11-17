@@ -2,9 +2,11 @@ package com.kingxkingt.noreel
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.PixelFormat
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -14,67 +16,77 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
+/**
+ * Blocks Instagram's dedicated Reels tab and full-screen Reels viewer.
+ *
+ * Instagram calls Reels "clips" internally. We use the specific clips_tab and
+ * clips_viewer_* IDs. We deliberately do not match generic reel_* IDs because
+ * those can refer to Stories.
+ */
 class ReelsAccessibilityService : AccessibilityService() {
     companion object {
         private const val TAG = "NoReel"
         private const val INSTAGRAM = "com.instagram.android"
-        private const val SCAN_MS = 300L
-        private const val RETRY_MS = 500L
-        private const val COOLDOWN_MS = 1200L
-        private const val MAX_TRIES = 4
-        private const val MAX_DEPTH = 30
+        private const val PREFS = "noreel"
+        private const val SCAN_INTERVAL_MS = 180L
+        private const val VERIFY_DELAY_MS = 450L
+        private const val MAX_BACK_ATTEMPTS = 3
+        private const val MAX_DEPTH = 35
+        private const val MAX_NODES = 1800
 
-        // Instagram calls Reels "clips" internally. Avoid generic reel_* IDs because
-        // Instagram also uses those for Stories.
-        private val VIEWER_ID_HINTS = listOf(
+        private val REELS_TAB_IDS = setOf("clips_tab")
+        private val REELS_VIEWER_IDS = setOf(
             "clips_viewer_view_pager",
-            "clips_viewer_container",
-            "clips_video_container",
-            "clips_recycler_view"
+            "clips_viewer_fragment_container"
         )
-        private val TAB_ID_HINTS = listOf(
-            "clips_tab",
-            "reels_tab",
-            "tab_clips",
-            "reels_nav_item",
-            "clips_nav_item"
+        private val INBOX_TAB_IDS = setOf(
+            "direct_tab",
+            "inbox_tab",
+            "action_bar_inbox_button"
         )
-        private val REELS_LABELS = listOf("reels", "reel", "reels tab", "reel tab", "watch reels")
+        private val REELS_LABELS = setOf("reels", "reel", "reels tab", "watch reels")
     }
 
-    private val handler = Handler(Looper.getMainLooper())
-    private var lastScan = 0L
-    private var lastBack = 0L
-    private var tries = 0
-    private var closing = false
-    private var windowManager: WindowManager? = null
-    private var cover: View? = null
-    private var coverBounds: Rect? = null
+    private data class TabMatch(
+        val bounds: Rect,
+        val selected: Boolean
+    )
 
-    private val verify = Runnable {
-        if (!closing) return@Runnable
-        if (!hasViewer()) {
-            closing = false
-            tries = 0
-            lastBack = 0L
-        } else if (tries < MAX_TRIES) {
-            sendBack("verification retry")
+    private val handler = Handler(Looper.getMainLooper())
+    private var lastScanAt = 0L
+    private var lastDiagnosticAt = 0L
+    private var lastBackAt = 0L
+    private var backAttempts = 0
+    private var closingViewer = false
+    private var windowManager: WindowManager? = null
+    private var tabCover: View? = null
+    private var tabCoverBounds: Rect? = null
+    private var tabExitAt = 0L
+
+    private val verifyViewer = Runnable {
+        if (!closingViewer) return@Runnable
+
+        if (!isViewerOpen()) {
+            closingViewer = false
+            backAttempts = 0
+            lastBackAt = 0L
+            Log.d(TAG, "Reels viewer closed")
+        } else if (backAttempts < MAX_BACK_ATTEMPTS) {
+            sendBack("viewer verification")
         } else {
-            Log.w(TAG, "Reels viewer remained after retry limit")
-            closing = false
+            closingViewer = false
+            recordStatus("Reels viewer detected but Instagram did not close")
+            Log.w(TAG, "Viewer still visible after retry limit")
         }
     }
 
-    private val reelsClickFallback = Runnable {
+    private val verifyTabExit = Runnable {
         if (!CommitmentTimer.isActive(this)) return@Runnable
         val root = rootInActiveWindow ?: return@Runnable
         try {
-            if (hasViewer(root)) {
-                removeCover()
-                closeViewer("Reels tab opened")
-            } else {
-                Log.d(TAG, "Reels tab click detected; returning to previous Instagram screen")
-                performGlobalAction(GLOBAL_ACTION_BACK)
+            if (root.packageName?.toString() == INSTAGRAM) {
+                val tab = findReelsTab(root, 0, intArrayOf(0))
+                if (tab?.selected == true) leaveReelsTab(root)
             }
         } finally {
             root.recycle()
@@ -84,126 +96,273 @@ class ReelsAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+
         serviceInfo = serviceInfo.apply {
             eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
                 AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
                 AccessibilityEvent.TYPE_VIEW_SCROLLED or
-                AccessibilityEvent.TYPE_VIEW_CLICKED
+                AccessibilityEvent.TYPE_VIEW_CLICKED or
+                AccessibilityEvent.TYPE_VIEW_SELECTED
             packageNames = arrayOf(INSTAGRAM)
-            notificationTimeout = 80
-            flags = flags or AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
-                AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+            notificationTimeout = 60
+            flags = flags or
+                AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+                AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
+                AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
         }
+
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putBoolean("service_connected", true)
+            .putString("last_detection", "Waiting for Instagram")
+            .apply()
+
         Log.i(TAG, "Accessibility service connected")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
+
         if (event.packageName?.toString() != INSTAGRAM) {
-            removeCover()
+            removeTabCover()
             return
         }
+
         if (!CommitmentTimer.isActive(this)) {
-            removeCover()
+            removeTabCover()
             return
         }
 
         when (event.eventType) {
-            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
+            AccessibilityEvent.TYPE_VIEW_CLICKED,
+            AccessibilityEvent.TYPE_VIEW_SELECTED -> {
                 val source = event.source
-                if (source != null) {
-                    val clickedReels = try {
-                        isReelsTabNode(source)
-                    } finally {
-                        source.recycle()
-                    }
-                    if (clickedReels) {
-                        handler.removeCallbacks(reelsClickFallback)
-                        handler.postDelayed(reelsClickFallback, 180L)
-                        return
-                    }
-                }
-                scanIfNeeded()
-            }
-
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
-                val source = event.source
-                val pagerScroll = if (source == null) false else try {
-                    isInsideViewer(source)
+                val isReelsTabEvent = if (source == null) false else try {
+                    isReelsTabOrChild(source)
                 } finally {
                     source.recycle()
                 }
-                if (pagerScroll) closeViewer("Reels pager scrolled") else scanIfNeeded()
+
+                if (isReelsTabEvent) {
+                    handler.removeCallbacks(verifyTabExit)
+                    handler.postDelayed(verifyTabExit, 220L)
+                }
+                scanSoon()
             }
 
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> scan()
-
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> scanIfNeeded()
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> scanSoon()
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> scanSoon()
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> scanSoon()
         }
     }
 
-    private fun scanIfNeeded() {
-        if (System.currentTimeMillis() - lastScan >= SCAN_MS) scan()
+    private fun scanSoon() {
+        val now = System.currentTimeMillis()
+        if (now - lastScanAt < SCAN_INTERVAL_MS) return
+        lastScanAt = now
+        handler.post { scanInstagramWindow() }
     }
 
-    private fun scan() {
-        lastScan = System.currentTimeMillis()
+    private fun scanInstagramWindow() {
+        if (!CommitmentTimer.isActive(this)) {
+            removeTabCover()
+            return
+        }
+
         val root = rootInActiveWindow ?: return
         try {
-            if (hasViewer(root)) {
-                removeCover()
-                closeViewer("full-screen Reels player detected")
+            if (root.packageName?.toString() != INSTAGRAM) return
+
+            // The full-screen viewer is checked first so a viewer launched from a DM,
+            // profile, feed, or Reels tab is closed without covering ordinary screens.
+            if (containsReelsViewer(root, 0, intArrayOf(0))) {
+                removeTabCover()
+                if (!closingViewer) {
+                    recordBlock("Full-screen Reels viewer")
+                }
+                closeViewer()
                 return
             }
 
-            val reelsTab = findReelsTab(root, 0)
-            if (reelsTab == null) {
-                removeCover()
-            } else if (reelsTab != coverBounds) {
-                showCover(reelsTab)
+            val tab = findReelsTab(root, 0, intArrayOf(0))
+            if (tab == null) {
+                removeTabCover()
+                recordNoMatchSparingly()
+                return
             }
+
+            if (tab.selected) {
+                removeTabCover()
+                leaveReelsTab(root)
+                return
+            }
+
+            if (tabCoverBounds != tab.bounds) {
+                showTabCover(tab.bounds)
+            }
+            recordStatus("Reels navigation tab found")
         } finally {
             root.recycle()
         }
     }
 
-    private fun viewId(node: AccessibilityNodeInfo): String =
-        (node.viewIdResourceName ?: "").lowercase()
+    private fun shortId(node: AccessibilityNodeInfo): String =
+        node.viewIdResourceName?.substringAfterLast('/')?.lowercase().orEmpty()
 
-    private fun nodeLabels(node: AccessibilityNodeInfo): List<String> =
+    private fun labels(node: AccessibilityNodeInfo): List<String> =
         listOfNotNull(
-            node.text?.toString(),
             node.contentDescription?.toString(),
+            node.text?.toString(),
             node.viewIdResourceName?.substringAfterLast('/')
         ).map { it.trim().lowercase() }.filter { it.isNotEmpty() }
 
-    private fun matchesAnyId(node: AccessibilityNodeInfo, hints: List<String>): Boolean {
-        val id = viewId(node)
-        return id.isNotEmpty() && hints.any { id.endsWith(it) || id.contains("/" + it) }
+    private fun hasReelsLabel(node: AccessibilityNodeInfo): Boolean =
+        labels(node).any { it in REELS_LABELS }
+
+    private fun isBottomNavigation(bounds: Rect): Boolean {
+        val screenHeight = resources.displayMetrics.heightPixels
+        return bounds.width() > 0 &&
+            bounds.height() > 0 &&
+            bounds.top >= screenHeight * 0.66f &&
+            bounds.bottom <= screenHeight + dp(48)
     }
 
-    private fun isViewerNode(node: AccessibilityNodeInfo): Boolean {
-        if (!node.isVisibleToUser || !matchesAnyId(node, VIEWER_ID_HINTS)) return false
+    private fun isReelsTabOrChild(node: AccessibilityNodeInfo): Boolean {
+        var current: AccessibilityNodeInfo? = AccessibilityNodeInfo.obtain(node)
+        var depth = 0
+        try {
+            while (current != null && depth <= 7) {
+                if (current.isVisibleToUser) {
+                    val id = shortId(current)
+                    if (id in REELS_TAB_IDS) return true
+
+                    val bounds = Rect()
+                    current.getBoundsInScreen(bounds)
+                    if (isBottomNavigation(bounds) && hasReelsLabel(current)) return true
+                }
+
+                val parent = current.parent
+                current.recycle()
+                current = parent
+                depth++
+            }
+        } finally {
+            current?.recycle()
+        }
+        return false
+    }
+
+    private fun findReelsTab(
+        node: AccessibilityNodeInfo,
+        depth: Int,
+        visited: IntArray
+    ): TabMatch? {
+        if (depth > MAX_DEPTH || visited[0] >= MAX_NODES || !node.isVisibleToUser) return null
+        visited[0]++
+
+        val id = shortId(node)
         val bounds = Rect()
         node.getBoundsInScreen(bounds)
-        val metrics = resources.displayMetrics
-        val screenArea = metrics.widthPixels.toDouble() * metrics.heightPixels.toDouble()
-        if (screenArea <= 0.0) return false
-        val coverage = bounds.width().toDouble() * bounds.height().toDouble() / screenArea
-        return bounds.width() >= metrics.widthPixels * 0.70 &&
-            bounds.height() >= metrics.heightPixels * 0.55 &&
-            coverage >= 0.60
+
+        // clips_tab is a specific Instagram navigation ID. Do not require a guessed
+        // bottom-screen percentage for this exact marker; that was too restrictive.
+        val exactId = id in REELS_TAB_IDS
+        val labelFallback = isBottomNavigation(bounds) && hasReelsLabel(node)
+
+        if (exactId || labelFallback) {
+            val target = bestTabBounds(node, bounds)
+            if (target != null) {
+                val selected = node.isSelected || hasSelectedDescendant(node, 0, intArrayOf(0))
+                return TabMatch(target, selected)
+            }
+        }
+
+        for (index in 0 until node.childCount) {
+            val child = node.getChild(index) ?: continue
+            val match = try {
+                findReelsTab(child, depth + 1, visited)
+            } finally {
+                child.recycle()
+            }
+            if (match != null) return match
+        }
+        return null
     }
 
-    private fun hasViewer(root: AccessibilityNodeInfo): Boolean = findViewer(root, 0)
+    private fun hasSelectedDescendant(
+        node: AccessibilityNodeInfo,
+        depth: Int,
+        visited: IntArray
+    ): Boolean {
+        if (depth > 4 || visited[0] > 100) return false
+        visited[0]++
+        for (index in 0 until node.childCount) {
+            val child = node.getChild(index) ?: continue
+            val selected = try {
+                child.isVisibleToUser &&
+                    (child.isSelected || hasSelectedDescendant(child, depth + 1, visited))
+            } finally {
+                child.recycle()
+            }
+            if (selected) return true
+        }
+        return false
+    }
 
-    private fun findViewer(node: AccessibilityNodeInfo, depth: Int): Boolean {
-        if (depth > MAX_DEPTH) return false
-        if (isViewerNode(node)) return true
+    /**
+     * Prefer the clickable bottom-navigation cell above the icon node. Some Instagram
+     * layouts expose the icon and its clickable parent as separate accessibility nodes.
+     */
+    private fun bestTabBounds(node: AccessibilityNodeInfo, original: Rect): Rect? {
+        val result = Rect(original)
+        val metrics = resources.displayMetrics
+        val maxCellWidth = metrics.widthPixels * 0.38f
+        val maxCellHeight = dp(145)
+
+        var current: AccessibilityNodeInfo? = AccessibilityNodeInfo.obtain(node)
+        var depth = 0
+        try {
+            while (current != null && depth < 6) {
+                val parent = current.parent
+                current.recycle()
+                current = parent
+                if (current != null) {
+                    val parentBounds = Rect()
+                    current.getBoundsInScreen(parentBounds)
+                    val looksLikeTabCell =
+                        current.isVisibleToUser &&
+                        current.isClickable &&
+                        isBottomNavigation(parentBounds) &&
+                        parentBounds.width() <= maxCellWidth &&
+                        parentBounds.height() <= maxCellHeight
+
+                    if (looksLikeTabCell) result.set(parentBounds)
+                }
+                depth++
+            }
+        } finally {
+            current?.recycle()
+        }
+
+        if (result.width() <= 0 || result.height() <= 0) return null
+        return result
+    }
+
+    private fun containsReelsViewer(
+        node: AccessibilityNodeInfo,
+        depth: Int,
+        visited: IntArray
+    ): Boolean {
+        if (depth > MAX_DEPTH || visited[0] >= MAX_NODES || !node.isVisibleToUser) return false
+        visited[0]++
+
+        // These IDs specifically identify the Clips/Reels viewer. Do not match reel_*:
+        // those IDs are also used by Instagram Stories and other non-Reels surfaces.
+        if (shortId(node) in REELS_VIEWER_IDS) return true
+
         for (index in 0 until node.childCount) {
             val child = node.getChild(index) ?: continue
             val found = try {
-                findViewer(child, depth + 1)
+                containsReelsViewer(child, depth + 1, visited)
             } finally {
                 child.recycle()
             }
@@ -212,121 +371,89 @@ class ReelsAccessibilityService : AccessibilityService() {
         return false
     }
 
-    private fun hasViewer(): Boolean {
+    private fun isViewerOpen(): Boolean {
         val root = rootInActiveWindow ?: return false
         return try {
-            hasViewer(root)
+            root.packageName?.toString() == INSTAGRAM &&
+                containsReelsViewer(root, 0, intArrayOf(0))
         } finally {
             root.recycle()
         }
     }
 
-    private fun isInsideViewer(node: AccessibilityNodeInfo): Boolean {
-        var current: AccessibilityNodeInfo? = AccessibilityNodeInfo.obtain(node)
-        var level = 0
-        try {
-            while (current != null && level <= 6) {
-                if (isViewerNode(current)) return true
-                val parent = current.parent
-                current.recycle()
-                current = parent
-                level++
+    private fun closeViewer() {
+        if (closingViewer && System.currentTimeMillis() - lastBackAt < VERIFY_DELAY_MS) return
+        closingViewer = true
+        sendBack("Reels viewer detected")
+    }
+
+    private fun sendBack(reason: String) {
+        lastBackAt = System.currentTimeMillis()
+        backAttempts++
+        val sent = performGlobalAction(GLOBAL_ACTION_BACK)
+        Log.i(TAG, "Back from Reels ($reason), attempt=$backAttempts, sent=$sent")
+
+        handler.removeCallbacks(verifyViewer)
+        handler.postDelayed(verifyViewer, VERIFY_DELAY_MS)
+    }
+
+    private fun leaveReelsTab(root: AccessibilityNodeInfo) {
+        val now = System.currentTimeMillis()
+        if (now - tabExitAt < 900L) return
+        tabExitAt = now
+
+        // Prefer the Instagram inbox tab so the user lands somewhere useful. If it
+        // is not exposed in the current hierarchy, fall back to Android Back.
+        val moved = clickTargetById(root, INBOX_TAB_IDS, 0, intArrayOf(0))
+        if (!moved) {
+            performGlobalAction(GLOBAL_ACTION_BACK)
+        }
+        Log.i(TAG, "Redirected away from selected Reels tab")
+    }
+
+    private fun clickTargetById(
+        node: AccessibilityNodeInfo,
+        targetIds: Set<String>,
+        depth: Int,
+        visited: IntArray
+    ): Boolean {
+        if (depth > MAX_DEPTH || visited[0] >= MAX_NODES || !node.isVisibleToUser) return false
+        visited[0]++
+
+        if (shortId(node) in targetIds) {
+            var current: AccessibilityNodeInfo? = AccessibilityNodeInfo.obtain(node)
+            var ancestorDepth = 0
+            try {
+                while (current != null && ancestorDepth <= 5) {
+                    if (current.isClickable &&
+                        current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    ) return true
+
+                    val parent = current.parent
+                    current.recycle()
+                    current = parent
+                    ancestorDepth++
+                }
+            } finally {
+                current?.recycle()
             }
-        } finally {
-            current?.recycle()
         }
-        return false
-    }
-
-    private fun isBottomNavigation(bounds: Rect): Boolean {
-        val height = resources.displayMetrics.heightPixels
-        return bounds.width() > 0 && bounds.height() > 0 &&
-            bounds.top >= height * 0.70f && bounds.bottom <= height + dp(12)
-    }
-
-    private fun hasClickableAncestor(node: AccessibilityNodeInfo): Boolean {
-        var current: AccessibilityNodeInfo? = AccessibilityNodeInfo.obtain(node)
-        var level = 0
-        try {
-            while (current != null && level <= 4) {
-                if (current.isClickable || current.isFocusable) return true
-                val parent = current.parent
-                current.recycle()
-                current = parent
-                level++
-            }
-        } finally {
-            current?.recycle()
-        }
-        return false
-    }
-
-    private fun isReelsTabNode(node: AccessibilityNodeInfo): Boolean {
-        if (!node.isVisibleToUser) return false
-        val bounds = Rect()
-        node.getBoundsInScreen(bounds)
-        if (!isBottomNavigation(bounds)) return false
-
-        if (matchesAnyId(node, TAB_ID_HINTS)) return true
-        val labels = nodeLabels(node)
-        val labelMatch = labels.any { label ->
-            REELS_LABELS.any { hint -> label == hint || label.startsWith(hint + " ") }
-        }
-        return labelMatch && hasClickableAncestor(node)
-    }
-
-    private fun findReelsTab(node: AccessibilityNodeInfo, depth: Int): Rect? {
-        if (depth > MAX_DEPTH) return null
-        if (isReelsTabNode(node)) return navItemBounds(node)
 
         for (index in 0 until node.childCount) {
             val child = node.getChild(index) ?: continue
-            val found = try {
-                findReelsTab(child, depth + 1)
+            val clicked = try {
+                clickTargetById(child, targetIds, depth + 1, visited)
             } finally {
                 child.recycle()
             }
-            if (found != null) return found
+            if (clicked) return true
         }
-        return null
+        return false
     }
 
-    private fun navItemBounds(node: AccessibilityNodeInfo): Rect {
-        val result = Rect()
-        node.getBoundsInScreen(result)
-        var current: AccessibilityNodeInfo? = AccessibilityNodeInfo.obtain(node)
-        var level = 0
-        try {
-            while (current != null && level < 5) {
-                val parent = current.parent
-                current.recycle()
-                current = parent
-                if (current != null) {
-                    val parentBounds = Rect()
-                    current.getBoundsInScreen(parentBounds)
-                    val maxWidth = resources.displayMetrics.widthPixels * 0.34f
-                    val maxHeight = resources.displayMetrics.heightPixels * 0.24f
-                    if (current.isVisibleToUser && current.isClickable &&
-                        isBottomNavigation(parentBounds) &&
-                        parentBounds.width() <= maxWidth &&
-                        parentBounds.height() <= maxHeight
-                    ) {
-                        result.set(parentBounds)
-                    }
-                }
-                level++
-            }
-        } finally {
-            current?.recycle()
-        }
-        return result
-    }
+    private fun showTabCover(bounds: Rect) {
+        removeTabCover()
 
-    private fun dp(value: Int): Int =
-        (value * resources.displayMetrics.density + 0.5f).toInt()
-
-    private fun showCover(bounds: Rect) {
-        removeCover()
         val padding = dp(4)
         val metrics = resources.displayMetrics
         val left = (bounds.left - padding).coerceAtLeast(0)
@@ -335,7 +462,15 @@ class ReelsAccessibilityService : AccessibilityService() {
         val bottom = (bounds.bottom + padding).coerceAtMost(metrics.heightPixels)
         if (right <= left || bottom <= top) return
 
-        val params = WindowManager.LayoutParams(
+        val darkMode = (resources.configuration.uiMode and 0x30) == 0x20
+        val overlay = View(this).apply {
+            setBackgroundColor(if (darkMode) Color.BLACK else Color.WHITE)
+            isClickable = true
+            isFocusable = false
+            contentDescription = "Reels tab blocked by NoReel"
+        }
+
+        val layout = WindowManager.LayoutParams(
             right - left,
             bottom - top,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
@@ -347,57 +482,64 @@ class ReelsAccessibilityService : AccessibilityService() {
             x = left
             y = top
         }
-        val nightMode = (resources.configuration.uiMode and 0x30) == 0x20
-        val overlay = View(this).apply {
-            setBackgroundColor(if (nightMode) Color.BLACK else Color.WHITE)
-            isClickable = true
-            isFocusable = false
-            contentDescription = "Reels tab blocked by NoReel"
-        }
 
         try {
-            windowManager?.addView(overlay, params)
-            cover = overlay
-            coverBounds = Rect(bounds)
-            Log.d(TAG, "Covered Instagram Reels tab at " + bounds.toShortString())
+            windowManager?.addView(overlay, layout)
+            tabCover = overlay
+            tabCoverBounds = Rect(bounds)
+            recordBlock("Reels navigation tab hidden")
+            Log.i(TAG, "Reels navigation tab covered at " + bounds.toShortString())
         } catch (error: Exception) {
-            Log.w(TAG, "Could not cover Instagram Reels tab", error)
+            Log.w(TAG, "Could not cover Reels tab", error)
+            recordStatus("Reels tab found, but the screen overlay could not be placed")
         }
     }
 
-    private fun removeCover() {
-        val current = cover ?: return
-        runCatching { windowManager?.removeView(current) }
-        cover = null
-        coverBounds = null
+    private fun removeTabCover() {
+        val overlay = tabCover ?: return
+        runCatching { windowManager?.removeView(overlay) }
+        tabCover = null
+        tabCoverBounds = null
     }
 
-    private fun closeViewer(reason: String) {
-        if (System.currentTimeMillis() - lastBack < COOLDOWN_MS) return
-        if (!closing) {
-            closing = true
-            tries = 0
-        }
-        sendBack(reason)
+    private fun recordBlock(description: String) {
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        val count = prefs.getInt("block_count", 0) + 1
+        prefs.edit()
+            .putInt("block_count", count)
+            .putString("last_detection", description)
+            .putLong("last_detection_at", System.currentTimeMillis())
+            .apply()
     }
 
-    private fun sendBack(reason: String) {
-        lastBack = System.currentTimeMillis()
-        tries++
-        val sent = performGlobalAction(GLOBAL_ACTION_BACK)
-        Log.d(TAG, "Back action (" + reason + "), attempt=" + tries + ", sent=" + sent)
-        handler.removeCallbacks(verify)
-        handler.postDelayed(verify, RETRY_MS)
+    private fun recordStatus(description: String) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putString("last_detection", description)
+            .putLong("last_detection_at", System.currentTimeMillis())
+            .apply()
     }
+
+    private fun recordNoMatchSparingly() {
+        val now = System.currentTimeMillis()
+        if (now - lastDiagnosticAt < 2500L) return
+        lastDiagnosticAt = now
+        recordStatus("Instagram checked; no Reels marker matched on this screen")
+    }
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density + 0.5f).toInt()
 
     override fun onInterrupt() {
-        removeCover()
+        removeTabCover()
     }
 
     override fun onDestroy() {
-        handler.removeCallbacks(verify)
-        handler.removeCallbacks(reelsClickFallback)
-        removeCover()
+        handler.removeCallbacks(verifyViewer)
+        handler.removeCallbacks(verifyTabExit)
+        removeTabCover()
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putBoolean("service_connected", false)
+            .apply()
         super.onDestroy()
     }
 }
