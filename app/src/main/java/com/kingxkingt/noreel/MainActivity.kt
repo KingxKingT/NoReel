@@ -283,12 +283,16 @@ class MainActivity : Activity() {
     }
 
     private fun enabled(): Boolean {
-        val expected = ComponentName(this, ReelsAccessibilityService::class.java).flattenToString()
+        val component = ComponentName(this, ReelsAccessibilityService::class.java)
+        val full = component.flattenToString()
+        val short = component.flattenToShortString()
         val list = Settings.Secure.getString(
             contentResolver,
             Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
         ) ?: return false
-        return list.split(':').any { it.equals(expected, ignoreCase = true) }
+        return list.split(':').any {
+            it.equals(full, ignoreCase = true) || it.equals(short, ignoreCase = true)
+        }
     }
 
     private fun requestDeviceAdmin() {
@@ -353,12 +357,13 @@ class MainActivity : Activity() {
         } else {
             "Not yet"
         }
-        diagnostics.text =
-            "Accessibility enabled: " + if (accessibility) "YES" else "NO" +
-            "\\nService connected: " + if (serviceConnected) "YES" else "NO" +
-            "\\nBlocks detected: " + blockCount +
-            "\\nLast check: " + lastDetection +
-            "\\nTime: " + detectionTime
+        diagnostics.text = listOf(
+            "Accessibility enabled: " + (if (accessibility) "YES" else "NO"),
+            "Service connected: " + (if (serviceConnected) "YES" else "NO"),
+            "Blocks detected: " + blockCount,
+            "Last check: " + lastDetection,
+            "Time: " + detectionTime
+        ).joinToString("\n")
 
         adminStatus.text = if (admin) "READY" else "ENABLE"
         adminStatus.setTextColor(if (admin) accent else muted)
@@ -391,7 +396,7 @@ class MainActivity : Activity() {
             ).format(java.util.Date(until))
             statusDescription.text = if (accessibility) {
                 "The Reels tab and full-screen Reels player are being blocked until " + end +
-                    if (owner) ". Device-owner restrictions are also active." else "."
+                    (if (owner) ". Device-owner restrictions are also active." else ".")
             } else {
                 "Your timer is still running, but Android accessibility is off. Turn NoReel back on in Accessibility settings."
             }
