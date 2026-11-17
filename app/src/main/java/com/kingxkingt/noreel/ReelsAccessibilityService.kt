@@ -56,6 +56,16 @@ class ReelsAccessibilityService : AccessibilityService() {
             "inbox_tab",
             "action_bar_inbox_button"
         )
+        // Only a dedicated Clips media container qualifies for the safe in-feed pause attempt.
+        // Generic reel_* IDs are intentionally excluded because Instagram also uses them for Stories.
+        private val INLINE_CLIPS_CONTAINER_IDS = setOf("clips_video_container")
+        private val PRIVATE_MESSAGE_CONTAINER_IDS = setOf(
+            "thread_message",
+            "thread_container",
+            "message_composer",
+            "direct_thread",
+            "shared_media_container"
+        )
         private val REELS_LABELS = setOf("reels", "reel", "reels tab", "reel tab", "watch reels")
     }
 
@@ -75,6 +85,7 @@ class ReelsAccessibilityService : AccessibilityService() {
     private var tabCoverBounds: Rect? = null
     private var lastTabSeenAt = 0L
     private var tabExitAt = 0L
+    private var lastInlinePauseAt = 0L
 
     private val verifyViewer = Runnable {
         if (!closingViewer) return@Runnable
@@ -116,7 +127,10 @@ class ReelsAccessibilityService : AccessibilityService() {
                 AccessibilityEvent.TYPE_VIEW_SCROLLED or
                 AccessibilityEvent.TYPE_VIEW_CLICKED or
                 AccessibilityEvent.TYPE_VIEW_SELECTED
-            packageNames = arrayOf(INSTAGRAM)
+            // Receive window changes from every package so an Instagram tab overlay
+            // is removed immediately when the user switches to another app. Content
+            // inspection below remains strictly scoped to Instagram.
+            packageNames = null
             notificationTimeout = 60
             flags = flags or
                 AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
@@ -136,7 +150,10 @@ class ReelsAccessibilityService : AccessibilityService() {
         event ?: return
 
         if (event.packageName?.toString() != INSTAGRAM) {
+            // The service used to subscribe only to Instagram, so Android never sent
+            // us the app-switch event and the accessibility overlay stayed on screen.
             removeTabCover()
+            handler.removeCallbacks(verifyTabExit)
             return
         }
 
@@ -203,6 +220,11 @@ class ReelsAccessibilityService : AccessibilityService() {
                 closeViewer()
                 return
             }
+
+            // Some Instagram builds expose a dedicated Pause control inside the
+            // inline Clips media container. Use it only when explicitly labelled;
+            // never click the video surface itself because that can open the Reel.
+            tryPauseInlineFeedReel(root)
 
             val tab = findReelsTab(root, 0, intArrayOf(0))
             if (tab == null) {
@@ -439,6 +461,129 @@ class ReelsAccessibilityService : AccessibilityService() {
                 child.recycle()
             }
             if (found) return true
+        }
+        return false
+    }
+
+    private fun isInlineClipsBounds(bounds: Rect): Boolean {
+        val metrics = resources.displayMetrics
+        val screenArea = metrics.widthPixels.toDouble() * metrics.heightPixels.toDouble()
+        if (screenArea <= 0.0 || bounds.width() <= 0 || bounds.height() <= 0) return false
+
+        val coverage = bounds.width().toDouble() * bounds.height().toDouble() / screenArea
+        return bounds.width() >= metrics.widthPixels * 0.55f &&
+            bounds.height() >= metrics.heightPixels * 0.25f &&
+            coverage >= 0.12 && coverage < 0.40 &&
+            bounds.top >= metrics.heightPixels * 0.08f &&
+            bounds.bottom <= metrics.heightPixels * 0.94f
+    }
+
+    private fun containsPrivateMessageContainer(
+        node: AccessibilityNodeInfo,
+        depth: Int,
+        visited: IntArray
+    ): Boolean {
+        if (depth > MAX_DEPTH || visited[0] >= MAX_NODES || !node.isVisibleToUser) return false
+        visited[0]++
+        if (shortId(node) in PRIVATE_MESSAGE_CONTAINER_IDS) return true
+
+        for (index in 0 until node.childCount) {
+            val child = node.getChild(index) ?: continue
+            val found = try {
+                containsPrivateMessageContainer(child, depth + 1, visited)
+            } finally {
+                child.recycle()
+            }
+            if (found) return true
+        }
+        return false
+    }
+
+    private fun tryPauseInlineFeedReel(root: AccessibilityNodeInfo): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - lastInlinePauseAt < 1400L) return false
+
+        // Shared media in a DM is intentionally left alone. Full-screen Reels
+        // launched from DMs are handled by the viewer detector above.
+        if (containsPrivateMessageContainer(root, 0, intArrayOf(0))) return false
+
+        return pauseInlineClipsContainer(root, 0, intArrayOf(0))
+    }
+
+    private fun pauseInlineClipsContainer(
+        node: AccessibilityNodeInfo,
+        depth: Int,
+        visited: IntArray
+    ): Boolean {
+        if (depth > MAX_DEPTH || visited[0] >= MAX_NODES || !node.isVisibleToUser) return false
+        visited[0]++
+
+        if (shortId(node) in INLINE_CLIPS_CONTAINER_IDS) {
+            val bounds = Rect()
+            node.getBoundsInScreen(bounds)
+            if (isInlineClipsBounds(bounds) &&
+                clickExplicitPauseControl(node, bounds, 0, intArrayOf(0))
+            ) {
+                lastInlinePauseAt = System.currentTimeMillis()
+                recordBlock("Inline feed Reel autoplay paused")
+                Log.i(TAG, "Paused an inline Clips video using its explicit pause control")
+                return true
+            }
+        }
+
+        for (index in 0 until node.childCount) {
+            val child = node.getChild(index) ?: continue
+            val paused = try {
+                pauseInlineClipsContainer(child, depth + 1, visited)
+            } finally {
+                child.recycle()
+            }
+            if (paused) return true
+        }
+        return false
+    }
+
+    private fun clickExplicitPauseControl(
+        node: AccessibilityNodeInfo,
+        containerBounds: Rect,
+        depth: Int,
+        visited: IntArray
+    ): Boolean {
+        if (depth > 12 || visited[0] >= 300 || !node.isVisibleToUser) return false
+        visited[0]++
+
+        val signals = labels(node)
+        val isPauseControl = signals.any { signal ->
+            signal == "pause" ||
+                signal == "pause video" ||
+                signal == "pause reel" ||
+                signal == "pausar" ||
+                signal == "pausar video" ||
+                signal == "إيقاف مؤقت" ||
+                signal.contains("pause_button") ||
+                signal.contains("pause video")
+        }
+        if (isPauseControl && node.isClickable) {
+            val controlBounds = Rect()
+            node.getBoundsInScreen(controlBounds)
+            val compactControl = controlBounds.width() > 0 &&
+                controlBounds.height() > 0 &&
+                controlBounds.width() <= containerBounds.width() * 0.45f &&
+                controlBounds.height() <= containerBounds.height() * 0.30f
+            if (compactControl && runCatching {
+                    node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                }.getOrDefault(false)
+            ) return true
+        }
+
+        for (index in 0 until node.childCount) {
+            val child = node.getChild(index) ?: continue
+            val clicked = try {
+                clickExplicitPauseControl(child, containerBounds, depth + 1, visited)
+            } finally {
+                child.recycle()
+            }
+            if (clicked) return true
         }
         return false
     }
