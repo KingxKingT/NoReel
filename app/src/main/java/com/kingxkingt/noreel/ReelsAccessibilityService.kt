@@ -249,7 +249,16 @@ class ReelsAccessibilityService : AccessibilityService() {
                 return
             }
 
-            if (tabCover == null || tabCoverBounds != tab.bounds) {
+            // Instagram can report slightly different bounds on consecutive
+            // accessibility scans. Replacing the overlay every time causes a visible
+            // blink. Keep the existing cover when the tab has only shifted by a few px.
+            val previousBounds = tabCoverBounds
+            val stableCover = tabCover != null && previousBounds != null &&
+                kotlin.math.abs(previousBounds.left - tab.bounds.left) <= dp(8) &&
+                kotlin.math.abs(previousBounds.top - tab.bounds.top) <= dp(8) &&
+                kotlin.math.abs(previousBounds.right - tab.bounds.right) <= dp(8) &&
+                kotlin.math.abs(previousBounds.bottom - tab.bounds.bottom) <= dp(8)
+            if (tabCover == null || (!stableCover && previousBounds != tab.bounds)) {
                 showTabCover(tab.bounds)
             }
             recordStatus("Reels navigation tab replaced with NoReel stop icon")
@@ -719,7 +728,9 @@ class ReelsAccessibilityService : AccessibilityService() {
                 super.onDraw(canvas)
                 // Draw only a compact circle-slash glyph. The rest of the tab cell
                 // stays transparent, so the Instagram bar keeps its native spacing.
-                val radius = minOf(dp(14).toFloat(), minOf(width, height) * 0.47f)
+                // Larger glyph remains readable at normal phone scale without
+                // expanding beyond the Instagram navigation cell.
+                val radius = minOf(dp(22).toFloat(), minOf(width, height) * 0.39f)
                 if (radius < dp(6)) return
                 val cx = width / 2f
                 val cy = height / 2f
