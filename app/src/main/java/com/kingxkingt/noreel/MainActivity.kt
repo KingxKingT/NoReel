@@ -1,6 +1,7 @@
 package com.kingxkingt.noreel
 
 import android.app.Activity
+import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Intent
 import android.os.Bundle
@@ -17,6 +18,7 @@ import android.widget.Toast
 class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var detail: TextView
+    private lateinit var adminButton: Button
     private lateinit var daysInput: EditText
     private lateinit var hoursInput: EditText
     private lateinit var startButton: Button
@@ -53,6 +55,12 @@ class MainActivity : Activity() {
         root.addView(status)
         root.addView(detail)
 
+        adminButton = Button(this).apply {
+            text = "Enable uninstall protection"
+            setOnClickListener { requestDeviceAdmin() }
+        }
+        root.addView(adminButton)
+
         root.addView(Button(this).apply {
             text = "Open Accessibility Settings"
             setOnClickListener {
@@ -80,7 +88,7 @@ class MainActivity : Activity() {
         root.addView(startButton)
 
         root.addView(TextView(this).apply {
-            text = "During a commitment, the app hides its timer controls. Device Owner mode adds stronger Android restrictions, but needs a fresh-device setup with ADB. No app can prevent every reset or privileged bypass."
+            text = "Device Admin adds a warning and requires deactivation before uninstalling. Device Owner mode adds stronger Android restrictions, but needs a fresh-device setup with ADB. No app can prevent every reset or privileged bypass."
             textSize = 13f
             setPadding(0, 22, 0, 0)
         })
@@ -89,11 +97,28 @@ class MainActivity : Activity() {
         refreshScreen()
     }
 
+    private fun requestDeviceAdmin() {
+        val admin = ComponentName(this, NoReelAdminReceiver::class.java)
+        val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
+            .putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, admin)
+            .putExtra(
+                DevicePolicyManager.EXTRA_ADD_EXPLANATION,
+                "NoReel uses Device Admin to make uninstalling harder during your commitment. You can deactivate it in Android security settings."
+            )
+        startActivity(intent)
+    }
+
     private fun beginCommitment() {
         val days = daysInput.text.toString().toLongOrNull() ?: 0L
         val hours = hoursInput.text.toString().toLongOrNull() ?: 0L
         if (days !in 0..365 || hours !in 0..23 || (days == 0L && hours == 0L)) {
             Toast.makeText(this, "Choose at least 1 hour, up to 365 days.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        if (!ProtectionPolicy.isAdminActive(this)) {
+            Toast.makeText(this, "Enable uninstall protection first.", Toast.LENGTH_LONG).show()
+            requestDeviceAdmin()
             return
         }
 
@@ -109,7 +134,7 @@ class MainActivity : Activity() {
         Toast.makeText(
             this,
             if (hardened) "Commitment started. Device Owner restrictions applied."
-            else "Commitment started. Standard protection is active.",
+            else "Commitment started. Basic uninstall protection is active.",
             Toast.LENGTH_LONG
         ).show()
         refreshScreen(until)
@@ -125,13 +150,10 @@ class MainActivity : Activity() {
     private fun refreshScreen(untilOverride: Long? = null) {
         val until = untilOverride ?: CommitmentTimer.activeUntil(this)
         val active = until > System.currentTimeMillis()
-        status.text = if (active) {
-            "Commitment active"
-        } else {
-            "Protection is off"
-        }
-
+        val adminActive = ProtectionPolicy.isAdminActive(this)
         val owner = ProtectionPolicy.isDeviceOwner(this)
+
+        status.text = if (active) "Commitment active" else "Protection is off"
         detail.text = buildString {
             if (active) {
                 append("Ends: ")
@@ -140,9 +162,12 @@ class MainActivity : Activity() {
                 append("Set a commitment to start blocking Reels.")
             }
             append("\n")
-            append(if (owner) "Device Owner mode: available" else "Device Owner mode: not set up")
+            append(if (adminActive) "Device Admin: enabled" else "Device Admin: not enabled")
+            append("\n")
+            append(if (owner) "Device Owner: enabled (stronger restrictions)" else "Device Owner: not set up")
         }
 
+        adminButton.visibility = if (adminActive) View.GONE else View.VISIBLE
         daysInput.visibility = if (active) View.GONE else View.VISIBLE
         hoursInput.visibility = if (active) View.GONE else View.VISIBLE
         startButton.visibility = if (active) View.GONE else View.VISIBLE
