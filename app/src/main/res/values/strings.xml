@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">NoReel</string>
-    <string name="accessibility_description">Detects the Instagram Reels tab and full-screen Reels player and blocks them during an active commitment. Regular messages and posts remain available.</string>
+    <string name="accessibility_description">Detects Instagram's Reels tab and full-screen Reels player and blocks them during an active commitment. Regular messages and posts remain available.</string>
 </resources>

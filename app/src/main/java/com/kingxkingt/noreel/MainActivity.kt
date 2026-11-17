@@ -148,7 +148,7 @@ class MainActivity : Activity() {
 
     private fun buildScreen() {
         val scroll = ScrollView(this).apply {
-            fillViewport = true
+            setFillViewport(true)
             clipToPadding = false
             setBackgroundColor(page)
         }
